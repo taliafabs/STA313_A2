@@ -1,0 +1,625 @@
+---
+title: "What does the data tell us about Toronto bike theft risks and prevention?"
+author: Talia Fabregas
+output: html_document
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+
+# Load the data
+knitr::opts_chunk$set(echo=FALSE, include=TRUE, eval=TRUE)
+required_packages <- c(
+  "lubridate", "sf", "tidyverse"
+  # include any packages to be installed here
+) 
+for (p in required_packages) { # install if missing
+  if (!require(p, character.only = TRUE)) {
+    install.packages(p, character.only = TRUE)
+  }
+}
+
+library(tidyverse)
+library(sf)
+library(lubridate)
+library(ggplot2)
+library(plotly)
+
+# bike thefts csv file
+bike_thefts_clean <- read_csv("cleaned_data/bike_thefts_clean.csv")
+
+# load the bike thefts GeoJSON file
+# bike_thefts_sf <- read_sf("cleaned_data/bike_thefts_clean_sf.geojson")
+
+# bike parking geojson file
+bike_parking_sf <- read_sf("data/bike_parking_map_data.geojson")
+
+# toronto neighbourhoods map data
+toronto_neighbourhoods_shp <- st_read("data/Neighbourhoods - 4326/Neighbourhoods - 4326.shp")
+
+# police divisions map data
+police_divisions_shp <- st_read("data/PoliceBoundariesData-4326/Police Boundaries Data - 4326.shp")
+
+# GeoJSON format maybe useful if you would like to combine
+# an external geospatial dataset
+bike_thefts_sf <- read_sf("data/Bicycle_Thefts_Open_Data.geojson") |>
+  mutate(
+    occurence_date = as_date(
+      OCC_DATE, format = "%a, %d %b %Y %H:%M:%S GMT"
+    ),
+    report_date = as_date(
+      REPORT_DATE, format = "%a, %d %b %Y %H:%M:%S GMT"
+    )
+  ) |>
+    filter(REPORT_YEAR >= 2014 & 
+           REPORT_YEAR <= 2023 & 
+           !is.na(NEIGHBOURHOOD_158) &
+           !is.na(STATUS) & 
+           !is.na(PREMISES_TYPE)
+  ) 
+
+bike_parking_sf <- st_read("data/bike_parking_map_data.geojson")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+year_month_summary <- bike_thefts_clean %>%
+  group_by(REPORT_YEAR, OCC_MONTH) %>%
+  summarise(Total_Thefts = n_distinct(OBJECTID), .groups = "drop")
+
+report_summary <- year_month_summary %>%
+  group_by(REPORT_YEAR) %>%
+  summarise(YEARLY_TOTAL = sum(Total_Thefts))
+
+neighbourhood_counts <- bike_thefts_sf |>
+  group_by(NEIGHBOURHOOD_158) |>
+  summarise(num_thefts = n_distinct(OBJECTID),
+            lat = mean(LAT_WGS84),
+            long = mean(LONG_WGS84),
+            .groups="drop")
+
+division_counts <- bike_thefts_sf |>
+  group_by(DIVISION) |>
+  summarise(num_thefts = n_distinct(OBJECTID),
+            .groups="drop")
+
+thefts_summary <- bike_thefts_clean %>%
+  group_by(REPORT_YEAR, PREMISES_TYPE) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  mutate(proportion = count / sum(count)) %>%
+  mutate(percentage = (count / sum(count)) * 100) %>%
+  ungroup()
+
+thefts_per_year <- thefts_summary %>%
+  group_by(REPORT_YEAR) %>%
+  summarise(total_thefts = sum(count), .groups = "drop")
+
+top_10_neighbourhoods <- neighbourhood_counts %>%
+  arrange(desc(num_thefts)) %>%
+  slice_head(n = 10)
+
+recovered_bikes <- bike_thefts_clean |>
+  mutate(is_recovered = ifelse(STATUS == "RECOVERED", 1, 0)) 
+
+# you're less likely to get a stolen bike back now than you were 10 years ago
+recovered_bikes_yearly <- recovered_bikes |>
+  group_by(REPORT_YEAR) |>
+  summarise(
+            num_thefts = n_distinct(OBJECTID),
+            num_not_recovered = n_distinct(OBJECTID) - sum(is_recovered),
+            num_recovered = sum(is_recovered),
+            percent_recovered  = round((mean(is_recovered) * 100), 2),
+            prop_recovered = mean(is_recovered),
+            .groups="drop")
+
+# no bikes in 8 of the 10 top neighbourhoods were recovered in 2023
+recovered_bikes_top10 <- recovered_bikes |>
+  filter(NEIGHBOURHOOD_158 %in% top_10_neighbourhoods$NEIGHBOURHOOD_158) |>
+  group_by(NEIGHBOURHOOD_158, REPORT_YEAR) |>
+  summarise(
+    num_thefts = n_distinct(OBJECTID),
+    num_recovered = sum(is_recovered),
+    num_not_recovered = n_distinct(OBJECTID) - sum(is_recovered),
+    prop_recovered = mean(is_recovered),
+    pct_recovered = round((mean(is_recovered) * 100), 2), 
+            .groups="drop")
+```
+
+Toronto commuters know traffic and public transit delays all too well. Cycling can be an efficient, healthy, and convenient way to get around the city. It can be faster than walking, sitting in traffic, or dealing with transit delays and it’s an excellent aerobic exercise for adults different ages and skill levels. As a Toronto cyclist myself, I know that many of my fellow cyclists are worried about their bikes being stolen. We hear about bike thefts all the time and we’re all familiar with the narrative that bikes are more likely to be stolen downtown. Is your bike really more likely to get stolen in downtown, or is the higher number of bike thefts downtown simply due to higher cyclist volume? And what should you be doing to keep your bike from being stolen?
+
+# A snapshot of bike theft trends from the past decade
+
+The good news is that bike thefts are not on the rise in the City of Toronto. The bad news is that if your bike gets stolen, you’re probably never going to get it back. No matter where in Toronto it was stolen.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE,  fig.subcap=c("There were fewer bike thefts in 2022 and 2023 than in 2014", "The recovery rate for stolen bikes has dropped since 2014"), cols.print=2}
+library(gridExtra)
+# Plot the line graph showing the total number of thefts per year
+p1 <- ggplot(thefts_per_year, aes(x = REPORT_YEAR, y = total_thefts)) +
+  geom_line(color = "#980043", size = 1) +  # Line graph
+  geom_point(color = "#980043", size = 2) +   # Points for each year
+  geom_hline(yintercept = 3499, linetype = "dashed", color = "#333335", size = 1) + 
+    annotate("text", x = 2021, y = 3650, label = "Average: 3499", color = "#333335", size = 4, hjust = 0) + # Annotation
+  labs(
+    title = "How many bike thefts have there been every year?",
+    x = "Year",
+    y = "Total # Bike Thefts"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1, size=7),
+    axis.text.y = element_text(size = 7)
+  ) +
+  scale_y_continuous(limits = c(2500, 4500)) +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 1)) 
+
+p2 <- ggplot(recovered_bikes_yearly, aes(x = REPORT_YEAR, y = prop_recovered)) +
+  geom_line(color = "#80b1d3", size = 1) +  # Line style and color
+  geom_point(color = "#80b1d3", size = 2.5) +   # Points for each year
+  labs(
+    title = "Less than 1% of Bikes Stolen Since 2021 Were Recovered",
+    x = "Year",
+    y = "% of stolen bikes recovered"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+    axis.text.y = element_text(size = 7)
+  ) +
+  scale_y_continuous(labels = scales::percent_format(), limits = c(0, 0.025)) +
+  scale_x_continuous(breaks = seq(2014, 2023, by = 1))  # Ensure all years appear
+
+p1
+p2
+```
+
+Since 2014, an average of 3499 bikes were stolen each year in Toronto. My analysis found that bike thieves are almost always successful, but they have not been emboldened over the last decade. Less than 1% of bikes stolen since 2021 were recovered and returned to the owner. From 2014 until the peak in 2018, bike thefts were increasing in Toronto. However, bike thefts decreased between 2020 and 2022, and there were fewer bike thefts in 2023 than in 2014.
+
+Even if bike thefts are not on the rise, knowing where they happen is an important step towards protecting your bike. Hover over the figure below to see the percentage of bike thefts that occurred at apartments/houses, outside, commercial, educational , transit, and other premises.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.cap="Most bikes are stolen from a residence (apartment or house) or outside, but the percentage of Toronto bike thefts each year per premise type has not changed much 2014."}
+
+library(plotly)
+library(ggplot2)
+library(scales)
+
+thefts_summary <- thefts_summary %>%
+  group_by(REPORT_YEAR) %>%
+  mutate(total_thefts = sum(count),  # Total number of thefts for the year
+         percentage = (count / total_thefts)) %>%  # Calculate percentage
+  ungroup() %>%  # Remove grouping
+  mutate(REPORT_YEAR = factor(REPORT_YEAR, levels = sort(unique(REPORT_YEAR))))
+
+# custom_colors2 <- rev(c("#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462", "#b3de69"))
+custom_colors2 <- rev(c("#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462", "#b3de69"))
+
+thefts_summary$PREMISES_TYPE <- factor(thefts_summary$PREMISES_TYPE,
+                                       levels = c("Apartment", "House", "Outside", "Commercial", "Educational", "Transit", "Other"))
+
+# Plot using plotly with the custom colors
+plot_ly(thefts_summary, x = ~REPORT_YEAR, y = ~percentage, color = ~PREMISES_TYPE,
+        colors = custom_colors2,  # Apply the custom color array here
+        type = 'bar',
+        text = ~paste(PREMISES_TYPE, ": ", scales::percent(percentage, accuracy = 0.01), sep = ""),
+        hoverinfo = 'text',
+        scalegroup = ~REPORT_YEAR) %>%
+  layout(
+    title = "What premise types do bike thieves target?",
+    xaxis = list(title = "Year"),
+    yaxis = list(title = "Percent of Toronto Bike Thefts", tickformat = ".0%"),
+    barmode = 'stack',
+    legend = list(title = list(text = "Premise Type")),
+    colorway = custom_colors2  # Make sure this is included to apply the colorway
+  )
+# ggplot(thefts_summary, aes(x = REPORT_YEAR, y = percentage, fill = PREMISES_TYPE)) +
+#   geom_bar(stat = "identity", position = "stack") +
+#   scale_fill_manual(values = custom_colors2) +
+#   scale_y_continuous(labels = percent_format(accuracy = 1)) +
+#   labs(
+#     title = "What Premise Types Do Bike Thieves Target?",
+#     x = "Year",
+#     y = "Percent of Toronto Bike Thefts",
+#     fill = "Premise Type"
+#   ) +
+#   theme_minimal() +
+#   theme(
+#     plot.title = element_text(hjust = 0.5),
+#     legend.title = element_text(face = "bold")
+#   )
+```
+
+This graph reveals some important insights about bike thieves' favorite premises. Bike thieves love to target bikes left unattended at cyclists' residences (both houses and apartments) and outside, but they have not had much success on commercial, educational, or transit premises. Commercial, educational, and transit premises often have staff and security cameras. Most houses, apartments, and outdoor areas where bikes can be parked do not. The majority of bike thefts reported since 2015 have taken place at a house, apartment, or outside. In 2023, nearly twelve times more bikes were stolen from residences (apartments and houses combined) than from transit premises.
+
+Since 2015, **more bike thefts have taken place at a residence** (house or apartment) **than any other premise**. In 2014, nearly one-third more bike thefts took place at houses than apartments. In 2024, there were nearly twice as many bike thefts at apartments compared to houses. The overall share of bike thefts that took place residences (including both houses and apartments) remained stable between 2014 and 2023 but it peaked in 2020 when many people stayed home due to the Covid-19 pandemic. The share of residence bike thefts at apartments has increased over time, while the share of residence bike thefts at houses has decreased over time. According to 2017 census data, more Torontonians live in apartments than houses, but it is difficult to draw a conclusion about risk of bike theft based on type of residence because the data does not reveal anything the number of Toronto cyclists who live in apartments versus houses. There is no evidence that living in a house or apartment puts a cyclist in Toronto at a higher risk of having their bike stolen, but one thing is clear: **more bikes are stolen from cyclists' homes than any other premise.** Securing your bike at home is an easy and effective way to prevent it from being stolen, regardless of the type of home you live in.
+
+# What you really need to know about bike thefts in downtown Toronto
+
+Yes, the highest concentration of bike thefts in 2023 is in and around the downtown core. No, this does not mean your bike is more likely to get stolen downtown. Hover over and click on the maps below to see which Toronto neighbourhoods had the most bike thefts in 2023 and which Toronto neighbourhoods have the most high-capacity outdoor bike parking facilities.
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: If we use high-capacity bike parking locations to measure cyclist volume, we will the Toronto neighbourhoods with the most bike thefts in 2023 are just the ones with the most cyclists and unattended bikes.
+library(plotly)
+
+bike_thefts_2023 <- bike_thefts_sf |>
+  filter(REPORT_YEAR == 2023 & LONG_WGS84 < -79 & LAT_WGS84 > 40)
+  # filter(OCC_YEAR >= 2014 & OCC_YEAR <= 2023 & LONG_WGS84 < -79 & LAT_WGS84 > 40)
+  
+
+bike_sf <- st_as_sf(bike_thefts_2023, coords = c("LONG_WGS84", "LAT_WGS84"), crs = 4326)
+
+bike_sf$NEIGHBOURHOOD_158 <- gsub("\\s*\\(.*\\)", "", bike_sf$NEIGHBOURHOOD_158)
+
+
+toronto_neighbourhoods_shp2 <- toronto_neighbourhoods_shp 
+
+toronto_neighbourhoods_shp2$AREA_DE8 <- gsub("\\s*\\(.*\\)", "", toronto_neighbourhoods_shp$AREA_DE8)
+
+theft_map <- ggplot()+
+    geom_sf(data = toronto_neighbourhoods_shp2, 
+            aes(text = paste(AREA_DE8)),
+            fill = "lightgray", 
+            color = "black", 
+            size = 0.3, alpha=0.3)  +
+    geom_sf(data = bike_sf, 
+            aes(text = paste(NEIGHBOURHOOD_158)),
+            color = "#980043", 
+            size = 0.7, 
+            alpha = 0.2) +
+    theme_minimal() +
+ theme_minimal() +
+    theme(
+      panel.grid = element_blank(),  # Remove grid lines
+      panel.background = element_blank(),
+      axis.text = element_blank(),  # Remove axis text
+      axis.ticks = element_blank(),  # Remove axis ticks
+      axis.title = element_blank(),
+      legend.title = element_text(size = 12),  # Customize legend title size
+      legend.text = element_text(size = 10),   # Customize legend text size
+      legend.position = "bottom"  # Position legend at the bottom
+    ) +
+    ggtitle("Most Toronto bike thefts occur in busiest neighbourhoods")
+
+theft_map <- ggplotly(theft_map, tooltip="text") %>%
+     layout(
+      hoverlabel = list(
+      bgcolor = "lightgray",  # White background
+      font = list(color = "black")  # Black text for contrast
+      ),
+      legend = list(
+      orientation = "h",       # Horizontal legend
+      x = 0.7,                 # Centered horizontally
+      y = 0.2,                # Place it under the map
+      xanchor = "center",      # Align to center
+      yanchor = "top"          # Align legend's top with the position
+    ),
+    margin = list(t = 50, r = 20, b = 100, l = 20)
+    )
+
+bike_parking_capacity <- bike_parking_sf |> 
+  filter(!is.na(BICYCLE_CAPACITY) & BICYCLE_CAPACITY > 0)
+
+bike_parking_capacity$BICYCLE_CAPACITY <- as.numeric(bike_parking_capacity$BICYCLE_CAPACITY)
+
+
+# Remove legends from both maps
+parking_map <- ggplot() +
+    # Add neighborhood polygons
+    geom_sf(data = toronto_neighbourhoods_shp2,
+            aes(text = paste(AREA_DE8)),
+            fill = "lightgray", 
+            color = "black", 
+            size = 0.3, alpha = 0.3) +
+    # Add bike parking locations with no legend
+    geom_sf(data = bike_parking_capacity, 
+            aes(size = sqrt(BICYCLE_CAPACITY), color = "Parking Spot"), 
+            alpha = 0.5) +
+    # Set a minimal theme
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),  # Remove grid lines
+      panel.background = element_blank(),
+      axis.text = element_blank(),  # Remove axis text
+      axis.ticks = element_blank(),  # Remove axis ticks
+      axis.title = element_blank(),
+      legend.position = "none"  # Remove legend
+    ) +
+    # Define scales for color and size (without legend)
+    scale_color_manual(
+      name = "", 
+      values = c("Parking Spot" = "steelblue")
+    ) +
+    scale_size_continuous(
+      name = "",  # Legend title
+      range = c(1, 1.5),  # Adjust the point size range as needed
+      breaks = c(5, 10, 20, 40, 60, 80, 100, 120),  # Adjust breaks to match your data range
+      labels = c("5", "10", "20", "40", "60", "80", "100", "120")
+    ) +
+    ggtitle("High-Theft Neighbourhoods Align with Top Bike Parking Spots")
+
+# Convert to plotly for interactivity
+parking_map <- ggplotly(parking_map, tooltip = "text") %>%
+    layout(
+      hoverlabel = list(
+        bgcolor = "lightgray",  
+        font = list(color = "black")
+      ),
+      margin = list(t = 50, r = 20, b = 100, l = 20)  # Add space for the caption below
+    )
+
+# Remove legends from the theft map
+theft_map <- ggplot() +
+    geom_sf(data = toronto_neighbourhoods_shp2, 
+            aes(text = paste(AREA_DE8)),
+            fill = "lightgray", 
+            color = "black", 
+            size = 0.3, alpha=0.3)  +
+    geom_sf(data = bike_sf, 
+            aes(text = paste(NEIGHBOURHOOD_158), color = "Bike Theft Location"), 
+            size = 0.5, 
+            alpha = 0.2) +
+    theme_minimal() +
+    theme(
+      panel.grid = element_blank(),  # Remove grid lines
+      panel.background = element_blank(),
+      axis.text = element_blank(),  # Remove axis text
+      axis.ticks = element_blank(),  # Remove axis ticks
+      axis.title = element_blank(),
+      legend.position = "none"  # Remove legend
+    ) +
+    scale_color_manual(
+      name = "", 
+      values = c("Bike Theft Location" = "#980043")  # Set color for bike theft locations
+    ) +
+    ggtitle("Where in Toronto did bike thefts happen in 2023?")
+
+theft_map <- ggplotly(theft_map, tooltip = "text") %>%
+    layout(
+      hoverlabel = list(
+        bgcolor = "lightgray",  # White background
+        font = list(color = "black")  # Black text for contrast
+      )
+    )
+
+# Combine both maps with captions
+combined_plot <- subplot(
+    theft_map %>% layout(
+        annotations = list(
+            x = 0.2, y = 0,
+            text = "Locations of Bike Thefts Reported in 2023",  # Caption for theft_map
+            showarrow = FALSE,
+            xref = "paper", yref = "paper",
+            font = list(size = 10, color = "black"),
+            align = "center"
+        )
+    ),
+    parking_map %>% layout(
+        annotations = list(
+            x = 0.8, y = 0,
+            text = "High-Capacity Outdoor Bike Parking Locations",  # Caption for parking_map
+            showarrow = FALSE,
+            xref = "paper", yref = "paper",
+            font = list(size = 10, color = "black"),
+            align = "center"
+        )
+    ),
+    nrows = 1, margin = 0.05  # Arrange plots in one row
+) %>%
+    layout(
+        title = list(
+            text = "Is your bike really more likely to get stolen downtown?",
+            x = 0.5  # Center the title
+        )
+    )
+
+# Display the combined plot
+combined_plot
+
+```
+
+When we compare the locations of reported bike thefts from 2023 to high-capacity bike parking locations, we see two very similar maps. Data about the number of cyclists and unattended bikes in each Toronto neighbourhoods is not readily available, so I have used the locations of City-owned high-capacity outdoor bike parking facilities to get an idea of which neighbourhoods have more cyclists, and therefore more unattended bikes. This reveals an important insight about bike theft risks in Toronto: **your bike is not necessarily more likely to be stolen in downtown.**
+
+The downtown neighbourhoods with the highest concentration of reported bike thefts in 2023 are the neighbourhoods with the most high-capacity bike parking locations. If you hover over the map that shows the locations of bike thefts reported in 2023, Yonge-Bay Corridor, Downtown Yonge-East, University, Annex, Wellington East, and Moss Park are some of the neighbourhoods that had the most bike thefts. But if you hover over the map that shows the locations of high-capacity outdoor bike parking in Toronto, you will see that these same neighbourhoods have the most high-capacity bike parking facilities. Yes, a lot of the bike thefts reported in 2023 are concentrated in downtown neighbourhoods. But a lot of unattended bikes are also concentrated in downtown neighbourhoods. Bike thieves have more success in these neighbourhoods simply because they present more opportunities for them.
+
+North York, near Yonge and Finch, saw a high concentration of bike thefts in 2023. The bike thefts in this area are not as high as in downtown, but this might be concerning because there are no high-capacity bike parking facilities in this area. This indicates that cyclists who live in Yonge-Doris, East Willowdale, or Newtonbrook West may be at a higher risk of having their bikes stolen because these neighbourhoods saw more bike thefts in 2023 than other neighbourhoods with no high-capacity bike parking facilities. This is a limited observation because high-capacity bike parking location data is not be an exact representation of cyclist volume and the number of unattended bikes in an area. It is unclear how cyclist volume in Yonge-Doris, East Willowdale, and Newtonbrook West compares to other neighbourhoods without high-capacity bike parking facilities.
+
+## Trends in the 10 downtown neighbourhoods with the most bike thefts since 2014
+
+Let’s take a closer look at the 10 downtown neighborhoods that have reported the most bike thefts since 2014 and how they compare to the rest of Toronto.
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: ["10 busy downtown neighbourhoods, out of Toronto's 158 neighbourhoods account for 41% of the bike thefts since 2014 due to high cyclist volume."]
+# Ensure required libraries are loaded
+library(tibble)
+library(plotly)
+
+# Data setup
+graph_this_data <- tibble(
+  category = c("10 Downtown Neighbourhoods", "The Other 148"),
+  proportion = c(
+    round((sum(top_10_neighbourhoods$num_thefts) / 
+             n_distinct(bike_thefts_clean$EVENT_UNIQUE_ID)), 2),
+    1 - round((sum(top_10_neighbourhoods$num_thefts) / 
+                 n_distinct(bike_thefts_clean$EVENT_UNIQUE_ID)), 2)
+  )
+)
+
+# Display the pie chart
+graph_this_data <- graph_this_data %>%
+  mutate(label = paste0(round(proportion * 100), "%"))
+
+static_pie_chart <- ggplot(graph_this_data, aes(x = "", y = proportion, fill = category)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  # scale_fill_manual(values = c("#e7298a", "gray")) +
+  scale_fill_manual(values = c("#EF553B", "#636EFA")) + # Custom colors
+  geom_text(
+    aes(label = label),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    color = "white"
+  ) +
+  labs(
+    title = "Where in Toronto are the most bikes stolen?",
+    fill = ""
+  ) +
+  theme_void() + # Removes unnecessary chart elements
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    legend.position = "bottom"
+  )
+static_pie_chart
+
+```
+
+We know that there are more cyclists, and therefore more opportunities for bike thefts in downtown Toronto. Two things can be true at once:
+
+1.  The risk of bike theft is not necessarily higher in downtown because there are more cyclists and unattended bikes there.
+
+2.  41% of the bike thefts between 2014 and 2023 took place in 10 of Toronto's 158 neighbourhoods. Unsurprisingly, these neighbourhoods are located downtown.
+
+Identifying premise trends in the 10 Toronto neighbourhoods that see the most bike thefts can help us come up with smarter prevention strategies and highlight the importance of secure bike storage.
+
+```{r}
+#| echo: false
+#| warning: false
+#| message: false
+#| fig-cap: Bike theft premise trends in the 10 neighbourhoods with the most thefts are similar to the city overall. University is a notable outlier, with more than half of its bike thefts taking place on educational premises.
+#| fig-cap-location: bottom
+
+neighbourhood_counts <- bike_thefts_sf |>
+  group_by(NEIGHBOURHOOD_158) |>
+  summarise(num_thefts = n_distinct(OBJECTID),
+            lat = mean(LAT_WGS84),
+            long = mean(LONG_WGS84),
+            .groups="drop") 
+
+top_10_neighbourhoods2 <- top_10_neighbourhoods
+
+top_10_neighbourhoods2$NEIGHBOURHOOD_158 <- gsub("\\s*\\(.*\\)", "", top_10_neighbourhoods2$NEIGHBOURHOOD_158)
+
+neighbourhood_counts2 <- bike_thefts_sf %>%
+  filter(NEIGHBOURHOOD_158 %in% top_10_neighbourhoods$NEIGHBOURHOOD_158) %>%
+  group_by(NEIGHBOURHOOD_158, PREMISES_TYPE) %>%
+  summarise(num_thefts = n_distinct(OBJECTID),  # Count distinct thefts
+            lat = mean(LAT_WGS84),               # Mean latitude for the neighborhood
+            long = mean(LONG_WGS84),             # Mean longitude for the neighborhood
+            .groups = "drop") %>%
+  group_by(NEIGHBOURHOOD_158) %>%
+  mutate(total_thefts = sum(num_thefts),  # Total thefts per neighborhood
+         percent_thefts = num_thefts / total_thefts * 100) %>%
+  ungroup()  # Remove grouping after calculation
+
+neighbourhood_counts2$NEIGHBOURHOOD_158 <- gsub("\\s*\\(.*\\)", "", neighbourhood_counts2$NEIGHBOURHOOD_158)
+
+neighbourhood_counts2$PREMISES_TYPE <- factor(
+  neighbourhood_counts2$PREMISES_TYPE,
+  levels = c("Other", "Transit", "Educational", "Commercial", "Outside", "House", "Apartment" )# Adjust as needed
+)
+
+custom_colors <- c("#8dd3c7", "#ffffb3", "#bebada", "#fb8072", "#80b1d3", "#fdb462", "#b3de69")
+
+
+ggplot(neighbourhood_counts2, aes(x = reorder(NEIGHBOURHOOD_158, num_thefts), y = num_thefts, fill = PREMISES_TYPE)) +
+  geom_bar(stat = "identity", position="stack") +  # Bar plot where height of bars corresponds to num_thefts
+  scale_fill_manual(name = "Premise Type", values = custom_colors) +
+  coord_flip() +  # Flip the axes for better readability of neighborhood names
+  labs(
+    title = "Where do bike thefts happen downtown?",
+    x = "Neighborhood",
+    y = "",
+    fill = "Premise Type"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),  # Remove grid lines for a cleaner look
+    axis.text.x = element_text(angle = 30, hjust = 1, size=8),  # Rotate x-axis labels if needed
+    legend.position = "bottom"  # Place the legend at the bottom
+  )
+```
+
+In 9 of the 10 neighbourhoods with the most bike thefts between 2014 and 2023, premise trends look similar to those across the City of Toronto. The majority of bike thefts took place at a residence or outside in all of these neighbourhoods except for University. The Yonge-Bay Corridor had fewer bike thefts at residences and more outside and on commercial premises; this makes sense because there are a lot of office and commercial buildings in this area.
+
+There is reason to believe that **bike thieves love the** **University of Toronto St. George Campus.** Nearly half the bike thefts reported in the University neighbourhood between 2014 and 2023 took place on educational premises. This is a significantly higher share than the other 9 most affected neighbourhoods and Toronto overall. As a student at the University of Toronto myself, I know that this is an area with a lot of unattended bikes because students who are in a rush to get to class may forget to properly secure their bikes.
+
+```{r}
+#| echo: false
+#| message: false
+#| warning: false
+#| fig-cap: Only 0.73% of stolen bikes were recovered in 2023, but in 8 of the 10 neighbourhoods with the most bike thefts since 2014, no stolen bikes were recovered in 2023. While the risk of bike theft is not higher here, the chances of recovering a stolen bike are lower.
+
+neighbourhood_recovery <- recovered_bikes_top10
+neighborhood_recovery_2023 <- recovered_bikes_top10 |>
+  filter(REPORT_YEAR == 2023)  # Filter data for the year 2023
+
+
+
+neighborhood_recovery_2023_long <- neighborhood_recovery_2023 %>%
+  select(NEIGHBOURHOOD_158, num_recovered, num_not_recovered) %>%
+  pivot_longer(cols = c(num_recovered, num_not_recovered), 
+               names_to = "status", 
+               values_to = "count") %>%
+  mutate(
+    status = recode(status, 
+                    num_recovered = "Recovered", 
+                    num_not_recovered = "Not Recovered")
+  ) %>%
+  group_by(NEIGHBOURHOOD_158) %>%
+  mutate(percentage = count / sum(count)) %>%  # Calculate percentages
+  ungroup()
+
+neighborhood_recovery_2023_long$status <- factor(neighborhood_recovery_2023_long$status, levels = c("Recovered", "Not Recovered"))
+
+neighborhood_recovery_2023_long$NEIGHBOURHOOD_158 <- gsub("\\s*\\(.*\\)", "", neighborhood_recovery_2023_long$NEIGHBOURHOOD_158)
+
+# Create the stacked bar graph
+plot <- ggplot(neighborhood_recovery_2023_long, aes(x = reorder(NEIGHBOURHOOD_158, count), y = percentage, fill = status)) +
+  geom_bar(stat = "identity", color = "black", size = 0.25,
+           aes(text = scales::percent(percentage))) +  # Set thinner outline
+  scale_fill_manual(
+    name = "Status",
+    values = c("Recovered" = "#80b1d3", "Not Recovered" = "#fb8072")
+  ) +
+  coord_flip() +  # Flip axes for better readability
+  labs(
+    title = "If Your Bike Gets Stolen Downtown, You're Really Not Getting it Back",
+    x = "Neighborhood",
+    y = "Percentage"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 12),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  scale_y_continuous(labels = scales::percent_format())
+
+interactive_plot <- ggplotly(plot, tooltip = "text")
+interactive_plot
+
+```
+
+Between 2021 and 2023, over less than 1% of bikes stolen in Toronto were never recovered. In 2023, none of the bikes stolen in 8 of the 10 neighborhoods with the most thefts between 2014-2023 were found. While there's no clear evidence that bikes are more likely to be stolen in these areas, the chances of recovering a stolen bike there are even slimmer. The Yonge-Bay Corridor has led Toronto in bike thefts for a decade, but not one cyclist who had their bike stolen there in 2023 ever got it back.
+
+My analysis found that the University of Toronto St. George Campus is a gold mine for bike thieves, and not a single bike stolen there in 2023 was ever recovered. This suggests that better theft prevention measures are needed on campus and students must ensure that their bikes are properly secured or make use of on-campus bike storage facilities.
+
+# Data-driven tips for Toronto cyclists
+
+Even though bike thefts in Toronto are not increasing, the recovery rate for stolen bikes is alarmingly low, with less than 1% of bikes stolen since 2021 found. My analysis found that more bike thefts happen in downtown neighbourhoods due to higher cyclist volume higher numbers of unattended bikes. **Prevention is key**, so here are some things every Toronto cyclist should know in order to protect their bikes and give thefts fewer opportunities:
+
+-   **Your bike is probably no more likely to get stolen, but even less likely to be recovered if it is stolen downtown** than in any other part of Toronto. 0.73% of stolen bikes across Toronto were recovered in 2023, but not a single bike stolen in the busy Yonge-Bay corridor has been recovered since 2021. If you park your bike downtown, use a **high-quality lock** or one of the city's **high-capacity bike parking locations.**
+
+-   **Bike thieves love to target apartments and houses**. If you live in an apartment, consider keeping your bike inside a your unit or your building's bike storage facility. I know that this is not an option for every cyclist in an apartment, so if you really have to leave your bike outside consider using two high-quality bike locks. If you live in a house, consider storing your bike inside a shed, garage, or your house instead of your front porch or anywhere else outside.
+
+-   **Never leave your bike outside without a lock.** Your front porch, driveway, right outside your apartment unit, that bench in the park or on the sidewalk, and small sidewalk bike racks are easy targets for bike thieves.
+
+-   **Consider double-locking your bike,** especially if you leave it on an outdoor rack or pole, or anywhere on the University of Toronto's St. George Campus. One limitation of this suggestion is that information about the percentage of stolen bikes that were locked and what type of lock was used is not available, but it doesn't hurt to take extra precautions.
+
+-   If you study or teach at the **University of Toronto St. George Campus**, consider using the on-campus indoor **bike enclosure room**.
+
+As a Toronto cyclist and student, I feel reassured to know that bike thefts in the city are not increasing. The data did not reveal anything surprising about bike theft trends or prevention. Locking your bike, storing it indoors, and using secure bike parking facilities whenever possible are still the best ways to protect your bike from thieves no matter where in Toronto you live and bike.
